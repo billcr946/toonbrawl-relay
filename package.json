@@ -1,1 +1,13 @@
-{"name":"toonbrawl-relay","version":"1.0.1","private":true,"description":"Toon Brawl online relay for Toonlight Brawl","main":"relay.cjs","scripts":{"start":"node relay.cjs"},"engines":{"node":">=18"}}
+{
+  "name": "toonbrawl-relay",
+  "version": "1.0.2",
+  "private": true,
+  "description": "Toon Brawl online relay for Toonlight Brawl",
+  "main": "relay.cjs",
+  "scripts": {
+    "start": "node relay.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

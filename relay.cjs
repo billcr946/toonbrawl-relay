@@ -17,7 +17,8 @@ class Conn extends EventEmitter {
     super(); this.socket = socket; this.req = req; this.max = maxMessage; this.buf = Buffer.alloc(0); this.frag = null; this.open = true;
     this.url = new URL(req.url, 'http://x'); this.ip = (req.headers['x-forwarded-for'] || socket.remoteAddress || '').toString().split(',')[0].trim();
     socket.setNoDelay(true);
-    socket.on('data', (d) => this._data(d));
+    this.seen = Date.now();
+    socket.on('data', (d) => { this.seen = Date.now(); this._data(d); });
     socket.on('close', () => this._closed());
     socket.on('error', () => this._closed());
   }
@@ -51,17 +52,22 @@ class Conn extends EventEmitter {
   // skip a frame when the client is slow, so a phone on bad Wi-Fi never builds up lag
   send(str) { if (!this.open) return false; if (this.socket.writableLength > (this.lagLimit || 256 * 1024)) return false; return this._send(0x1, Buffer.from(String(str), 'utf8')); }
   json(o) { return this.send(JSON.stringify(o)); }
+  ping() { return this._send(0x9, Buffer.alloc(0)); }
   close(code = 1000) { if (!this.open) return; const b = Buffer.alloc(2); b.writeUInt16BE(code, 0); this._send(0x8, b); this.open = false; try { this.socket.end(); } catch { } this.emit('close'); }
 }
 
 // accept(req, socket) → Conn, or null when it isn't a valid WebSocket upgrade
+const ALL = new Set(); // every open connection, for the heartbeat
 function accept(req, socket, opts = {}) {
   const key = req.headers['sec-websocket-key'];
   if (!key || String(req.headers.upgrade || '').toLowerCase() !== 'websocket') { try { socket.destroy(); } catch { } return null; }
   const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
-  return new Conn(socket, req, opts);
+  const c = new Conn(socket, req, opts); ALL.add(c); c.on('close', () => ALL.delete(c)); return c;
 }
+// heartbeat: hosting sites drop quiet WebSockets after a minute or two without telling anyone, so ping every
+// connection every 20 s and close the ones that stopped answering (both ends then reconnect by themselves)
+setInterval(() => { const now = Date.now(); for (const c of ALL) { if (now - c.seen > 65000) { try { c.socket.destroy(); } catch { } c._closed(); } else c.ping(); } }, 20000).unref?.();
 
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -109,34 +115,48 @@ function onHost(conn, roomId, secret) {
   if (room.host && room.host.open) room.host.close(4000);
   room.host = conn; room.since = Date.now(); room.ver = room.ver || ''; conn.lagLimit = 8 << 20; log('host up', roomId);
   conn.json({ t: 'relay', ok: true, room: roomId });
-  for (const [pid, p] of room.players) conn.json({ t: 'pjoin', pid, name: p.name, code: p.code, via: 'relay' });
+  for (const p of room.players.values()) if (p.conn) p.conn.json({ t: 'hostback' });
+  for (const [pid, p] of room.players) conn.json({ t: 'pjoin', pid, name: p.name, code: p.code, via: 'relay', away: !p.conn });
   conn.on('message', (m) => {
-    if (m.charCodeAt(0) === 76 /* L */) { const s = m.slice(1); for (const p of room.players.values()) if (p.ready) p.conn.send(s); return; }
+    if (m.charCodeAt(0) === 76 /* L */) { const s = m.slice(1); for (const p of room.players.values()) if (p.ready && p.conn) p.conn.send(s); return; }
     let o; try { o = JSON.parse(m); } catch { return; }
     if (o.t === 'filedata') { const cb = pending.get(o.id); if (cb) cb(o); return; }
     if (o.t === 'hello') { room.ver = String(o.version || ''); return; }
-    if (o.t === 'to') { const p = room.players.get(o.pid); if (p && o.msg) { if (o.msg.t === 'accept') p.ready = true; p.conn.json(o.msg); } }
-    else if (o.t === 'kick') { const p = room.players.get(o.pid); if (p) { p.conn.json({ t: 'bye', why: o.why || 'removed' }); p.conn.close(4001); } }
+    if (o.t === 'ping') { conn.json({ t: 'pong', at: o.at }); return; }
+    if (o.t === 'to') { const p = room.players.get(o.pid); if (p && o.msg) { if (o.msg.t === 'accept') p.ready = true; if (p.conn) p.conn.json(o.msg); } }
+    else if (o.t === 'kick') { const p = room.players.get(o.pid); if (p) { if (p.conn) { p.conn.json({ t: 'bye', why: o.why || 'removed' }); p.kicked = true; p.conn.close(4001); } room.players.delete(o.pid); } }
   });
   conn.on('close', () => {
     if (room.host !== conn) return; room.host = null; log('host gone', roomId);
-    // players wait a minute for the streamer to come back, then the room closes
-    setTimeout(() => { if (!room.host) { for (const p of room.players.values()) { try { p.conn.json({ t: 'bye', why: 'The streamer went offline.' }); p.conn.close(4004); } catch { } } rooms.delete(roomId); } }, 60000).unref?.();
+    // players wait three minutes for the streamer's app to come back, then the room closes
+    for (const p of room.players.values()) if (p.conn) p.conn.json({ t: 'hostaway' });
+    setTimeout(() => { if (!room.host) { for (const p of room.players.values()) { try { if (p.conn) { p.conn.json({ t: 'bye', why: 'The streamer went offline.' }); p.conn.close(4004); } } catch { } } rooms.delete(roomId); } }, 180000).unref?.();
   });
 }
-function onPlayer(conn, roomId, name) {
+function onPlayer(conn, roomId, name, resume) {
   const room = rooms.get(roomId);
   if (!room || !room.host) { conn.json({ t: 'error', why: 'The streamer is not online right now.' }); return conn.close(4004); }
-  if (room.players.size >= LIMITS.playersPerRoom) { conn.json({ t: 'error', why: 'Too many players are connected. Try again in a bit.' }); return conn.close(4029); }
-  const pid = 'R' + (++room.n), p = { conn, name: String(name || '').replace(/[^\w .-]/g, '').slice(0, 24), code: newCode(room), ready: false, n: 0, t0: Date.now() };
-  room.players.set(pid, p); conn.json({ t: 'code', code: p.code, via: 'relay' }); room.host.json({ t: 'pjoin', pid, name: p.name, code: p.code, via: 'relay' });
+  // a player whose connection dropped comes back with their key and keeps their code and place
+  let pid = null, p = null;
+  if (resume) for (const [id, q] of room.players) if (q.key === resume) { pid = id; p = q; break; }
+  if (p) { if (p.conn && p.conn !== conn) { p.replaced = true; p.conn.close(4000); } clearTimeout(p.goneT); p.conn = conn; conn.json({ t: 'code', code: p.code, key: p.key, via: 'relay', resumed: true }); room.host.json({ t: 'pback', pid }); }
+  else {
+    if (room.players.size >= LIMITS.playersPerRoom) { conn.json({ t: 'error', why: 'Too many players are connected. Try again in a bit.' }); return conn.close(4029); }
+    pid = 'R' + (++room.n); p = { conn, name: String(name || '').replace(/[^\w .-]/g, '').slice(0, 24), code: newCode(room), key: crypto.randomBytes(12).toString('hex'), ready: false, n: 0, t0: Date.now() };
+    room.players.set(pid, p); conn.json({ t: 'code', code: p.code, key: p.key, via: 'relay' }); room.host.json({ t: 'pjoin', pid, name: p.name, code: p.code, via: 'relay' });
+  }
   conn.on('message', (m) => {
     const now = Date.now(); if (now - p.t0 >= 1000) { p.t0 = now; p.n = 0; } if (++p.n > LIMITS.inputsPerSec) return;
     let o; try { o = JSON.parse(m); } catch { return; }
     if (o.t === 'in') { if (room.host) room.host.json({ t: 'pin', pid, l: !!o.l, r: !!o.r, u: !!o.u, d: !!o.d, press: Array.isArray(o.press) ? o.press.slice(0, 6).map(String) : [] }); }
     else if (o.t === 'ping') conn.json({ t: 'pong', at: o.at });
   });
-  conn.on('close', () => { room.players.delete(pid); if (room.host) room.host.json({ t: 'pleave', pid }); });
+  conn.on('close', () => {
+    if (p.conn !== conn) return; p.conn = null;
+    if (p.kicked) { room.players.delete(pid); if (room.host) room.host.json({ t: 'pleave', pid }); return; }
+    // keep their place for two minutes in case they come straight back
+    p.goneT = setTimeout(() => { if (!p.conn && room.players.get(pid) === p) { room.players.delete(pid); if (room.host) room.host.json({ t: 'pleave', pid }); } }, 120000); p.goneT.unref?.();
+  });
 }
 const server = http.createServer(serve);
 server.on('upgrade', (req, socket) => {
@@ -148,7 +168,7 @@ server.on('upgrade', (req, socket) => {
   if (isHost && secret.length < 16) { socket.destroy(); return; }
   const conn = accept(req, socket, { maxMessage: isHost ? LIMITS.hostMsg : LIMITS.playerMsg }); if (!conn) return;
   perIp.set(ip, n + 1); conn.on('close', () => { const k = (perIp.get(ip) || 1) - 1; if (k <= 0) perIp.delete(ip); else perIp.set(ip, k); });
-  if (isHost) onHost(conn, room, secret); else onPlayer(conn, room, u.searchParams.get('name'));
+  if (isHost) onHost(conn, room, secret); else onPlayer(conn, room, u.searchParams.get('name'), String(u.searchParams.get('resume') || '').slice(0, 64));
 });
 if (require.main === module) server.listen(PORT, () => log(`Toon Brawl relay on port ${PORT}`));
 module.exports = { server, rooms };
